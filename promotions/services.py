@@ -1,52 +1,42 @@
 from decimal import Decimal
 
-from django.utils import timezone
+from django.contrib.auth.models import AbstractBaseUser
 from django.db import transaction
-from rest_framework.exceptions import ValidationError
+from django.utils import timezone
 
+from orders.models import Product
+from promotions.constants import (
+    PERCENT_BASE,
+    PROMO_CODE_ALREADY_USED,
+    PROMO_CODE_CONCURRENT_USAGE,
+    PROMO_CODE_EXPIRED,
+    PROMO_CODE_NOT_APPLICABLE,
+    PROMO_CODE_NOT_FOUND,
+    PROMO_CODE_USAGE_LIMIT,
+)
+from promotions.exceptions import PromoCodeValidationError
 from promotions.models import PromoCode, UserPromoUsage
-
-
-class PromoCodeValidationError(ValidationError):
-    """Custom API exception specialized for descriptive promotion validation issues."""
-    pass
+from promotions.types import CalculatedLineItem, OrderCalculationResult, OrderLineInput
 
 
 class PromoCodeService:
-    """
-    Domain service isolating the core business rules for promo validation and calculations.
-    """
+    """Promo code validation and order pricing."""
 
     @classmethod
-    def validate_and_calculate_discount(cls, promo_code_str: str, user, items_data: list) -> dict:
-        """
-        Validates a promotional coupon against 6 core criteria and calculates final costs.
+    def validate_and_calculate_discount(
+        cls,
+        promo_code_str: str,
+        user: AbstractBaseUser,
+        items_data: list[OrderLineInput],
+    ) -> OrderCalculationResult:
+        """Validate promo rules and return calculated order totals."""
+        promocode = cls._get_active_promo(promo_code_str)
+        cls._ensure_user_has_not_used_promo(user, promocode)
 
-        Expected items_data format: [{'product': Product, 'quantity': int}, ...]
-        Returns a dict with: 'promocode', 'total_amount_raw', 'total_amount_discounted'
-        """
-        # Rule 1: The promo code must exist in the database
-        try:
-            promocode = PromoCode.objects.get(code=promo_code_str)
-        except PromoCode.DoesNotExist:
-            raise PromoCodeValidationError({"promocode": "The promo code does not exist."})
-
-        # Rule 2: The promo code must not be expired
-        if promocode.valid_until < timezone.now():
-            raise PromoCodeValidationError({"promocode": "This promo code has expired."})
-
-        # Rule 3: The promo code must not exceed its global total usage limit
-        if promocode.current_usages >= promocode.max_usages:
-            raise PromoCodeValidationError({"promocode": "This promo code has reached its maximum usage limit."})
-
-        # Rule 4: A single user cannot use the same promo code more than once
-        if UserPromoUsage.objects.filter(user=user, promocode=promocode).exists():
-            raise PromoCodeValidationError({"promocode": "You have already used this promo code once."})
-
-        calculated_items = []
+        calculated_items: list[CalculatedLineItem] = []
         total_price = Decimal("0.00")
         total_discounted = Decimal("0.00")
-        is_promo_applied_at_least_once = False
+        is_promo_applied = False
 
         for item in items_data:
             good = item["good"]
@@ -55,57 +45,71 @@ class PromoCodeService:
             total_price += line_raw_price
 
             item_discount_fraction = Decimal("0.00")
+            if cls._is_promo_applicable_to_product(promocode, good):
+                item_discount_fraction = Decimal(promocode.discount_percent) / PERCENT_BASE
+                is_promo_applied = True
 
-            # Apply rules 5 & 6
-            if not good.is_excluded_from_promotions:
-                if not promocode.allowed_categories or good.category in promocode.allowed_categories:
-                    item_discount_fraction = Decimal(promocode.discount_percent) / Decimal("100.00")
-                    is_promo_applied_at_least_once = True
-
-            line_discount_amount = line_raw_price * item_discount_fraction
-            line_final_total = line_raw_price - line_discount_amount
+            line_final_total = line_raw_price - (line_raw_price * item_discount_fraction)
             total_discounted += line_final_total
+            calculated_items.append(
+                {
+                    "good": good,
+                    "quantity": quantity,
+                    "price": good.price,
+                    "discount": item_discount_fraction,
+                    "total": line_final_total,
+                }
+            )
 
-            calculated_items.append({
-                "good": good,
-                "quantity": quantity,
-                "price": good.price,
-                "discount": item_discount_fraction,
-                "total": line_final_total
-            })
+        if not is_promo_applied:
+            raise PromoCodeValidationError({"promo_code": PROMO_CODE_NOT_APPLICABLE})
 
-        if not is_promo_applied_at_least_once:
-            raise PromoCodeValidationError(
-                {"promo_code": "The promo code is valid but cannot be applied to any items."})
-
-        # Global aggregate discount percentage representation
-        global_discount_fraction = Decimal(promocode.discount_percent) / Decimal("100.00")
-
+        global_discount_fraction = Decimal(promocode.discount_percent) / PERCENT_BASE
         return {
             "promo_code_obj": promocode,
             "calculated_items": calculated_items,
             "price": total_price,
             "discount": global_discount_fraction,
-            "total": total_discounted
+            "total": total_discounted,
         }
 
     @classmethod
     @transaction.atomic
-    def register_usage(cls, promocode: PromoCode, user) -> None:
-        """
-        Locks the row using select_for_update to avoid concurrent transaction race conditions,
-        verifies remaining slots, increments the global count, and logs user utilization.
-        """
-        # Lock the row to prevent over-allocation during concurrent requests
+    def register_usage(cls, promocode: PromoCode, user: AbstractBaseUser) -> None:
+        """Record promo usage with row-level locking."""
         locked_promocode = PromoCode.objects.select_for_update().get(pk=promocode.pk)
 
         if locked_promocode.current_usages >= locked_promocode.max_usages:
-            raise PromoCodeValidationError(
-                {"promocode": "Promo usage threshold was just breached by a parallel checkout."})
+            raise PromoCodeValidationError({"promo_code": PROMO_CODE_CONCURRENT_USAGE})
 
-        # Log the immutable fact of single user coupon utilization
         UserPromoUsage.objects.create(user=user, promocode=locked_promocode)
-
-        # Safely persist incremented counters back to the DB layer
         locked_promocode.current_usages += 1
-        locked_promocode.save()
+        locked_promocode.save(update_fields=["current_usages"])
+
+    @classmethod
+    def _get_active_promo(cls, promo_code_str: str) -> PromoCode:
+        try:
+            promocode = PromoCode.objects.get(code=promo_code_str)
+        except PromoCode.DoesNotExist as exc:
+            raise PromoCodeValidationError({"promo_code": PROMO_CODE_NOT_FOUND}) from exc
+
+        if promocode.valid_until < timezone.now():
+            raise PromoCodeValidationError({"promo_code": PROMO_CODE_EXPIRED})
+
+        if promocode.current_usages >= promocode.max_usages:
+            raise PromoCodeValidationError({"promo_code": PROMO_CODE_USAGE_LIMIT})
+
+        return promocode
+
+    @staticmethod
+    def _ensure_user_has_not_used_promo(user: AbstractBaseUser, promocode: PromoCode) -> None:
+        if UserPromoUsage.objects.filter(user=user, promocode=promocode).exists():
+            raise PromoCodeValidationError({"promo_code": PROMO_CODE_ALREADY_USED})
+
+    @staticmethod
+    def _is_promo_applicable_to_product(promocode: PromoCode, good: Product) -> bool:
+        if good.is_excluded_from_promotions:
+            return False
+        if promocode.allowed_categories and good.category not in promocode.allowed_categories:
+            return False
+        return True

@@ -1,27 +1,22 @@
 from rest_framework import status
-from rest_framework.views import APIView
+from rest_framework.request import Request
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.views import APIView
 
+from orders.openapi import order_create_schema
 from orders.serializers import OrderCreateSerializer
 
 
+@order_create_schema
 class OrderCreateAPIView(APIView):
-    """
-    HTTP POST Endpoint to securely process cart items, validate promotional campaigns,
-    and create client system orders.
-    """
-    permission_classes = [IsAuthenticated]
+    """Create an order with optional promo code."""
 
-    def post(self, request, *args, **kwargs):
-        """
-        Receives order items payload and coupon strings, processing checkout pipelines.
-        """
-        serializer = OrderCreateSerializer(data=request.data, context={"request": request})
+    serializer_class = OrderCreateSerializer
 
-        if serializer.is_valid():
-            order = serializer.save()
-            # Return serialized order data along with HTTP 201 Created status
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+    def post(self, request: Request, *args, **kwargs) -> Response:
+        serializer = OrderCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)

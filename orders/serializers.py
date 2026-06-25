@@ -1,19 +1,22 @@
-from decimal import Decimal
+from typing import Any
 
-from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import AbstractBaseUser
 from django.db import transaction
+from rest_framework import serializers
 
-from orders.models import Product, Order, OrderItem
+from orders.models import Order, OrderItem, Product
+from orders.services import calculate_order_without_promo
+from promotions.exceptions import PromoCodeValidationError
 from promotions.services import PromoCodeService
+from promotions.types import OrderLineInput
 
 User = get_user_model()
 
 
 class OrderItemResponseSerializer(serializers.ModelSerializer):
-    """
-    Item nested structure inside the response body.
-    """
+    """Order line item in API response."""
+
     good_id = serializers.IntegerField(source="good.id")
 
     class Meta:
@@ -22,31 +25,24 @@ class OrderItemResponseSerializer(serializers.ModelSerializer):
 
 
 class OrderItemPostSerializer(serializers.Serializer):
-    """
-    Validates individual item structures inside the incoming basket payload.
-    """
+    """Order line item in API request."""
+
     good_id = serializers.IntegerField()
     quantity = serializers.IntegerField(min_value=1)
 
-    def validate_good_id(self, value):
-        """
-        Ensures the requested product actually exists in the database.
-        """
+    def validate_good_id(self, value: int) -> Product:
         try:
             return Product.objects.get(id=value)
-        except Product.DoesNotExist:
-            raise serializers.ValidationError("Requested product does not exist.")
+        except Product.DoesNotExist as exc:
+            raise serializers.ValidationError("Requested product does not exist.") from exc
 
 
 class OrderCreateSerializer(serializers.ModelSerializer):
-    """
-    Handles request validation and database orchestration for order checkouts.
-    """
+    """Validate and create an order."""
+
     user_id = serializers.IntegerField()
     goods = OrderItemPostSerializer(many=True, write_only=True)
     promo_code = serializers.CharField(required=False, allow_blank=True, allow_null=True, write_only=True)
-
-    # Remap model outputs into client contract fields using serializermethods/source fields
     order_id = serializers.IntegerField(source="id", read_only=True)
     response_goods = OrderItemResponseSerializer(many=True, source="items", read_only=True)
 
@@ -55,101 +51,73 @@ class OrderCreateSerializer(serializers.ModelSerializer):
         fields = ["user_id", "order_id", "goods", "promo_code", "response_goods", "price", "discount", "total"]
         read_only_fields = ["order_id", "response_goods", "price", "discount", "total"]
 
-    def validate_user_id(self, value):
+    def validate_user_id(self, value: int) -> AbstractBaseUser:
         try:
             return User.objects.get(id=value)
-        except User.DoesNotExist:
-            raise serializers.ValidationError("User does not exist.")
+        except User.DoesNotExist as exc:
+            raise serializers.ValidationError("User does not exist.") from exc
 
-    def validate(self, attrs):
-        """
-        Transforms product IDs into object references and executes the PromoCodeService
-        to calculate raw and discounted totals before saving.
-        """
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         user = attrs["user_id"]
-        raw_goods = attrs.get("goods", [])
-        promo_code_str = attrs.get("promo_code")
-
-        prepared_items = [
+        prepared_items: list[OrderLineInput] = [
             {"good": item["good_id"], "quantity": item["quantity"]}
-            for item in raw_goods
+            for item in attrs.get("goods", [])
         ]
+        promo_code = attrs.get("promo_code")
 
-        if promo_code_str:
-            calc_result = PromoCodeService.validate_and_calculate_discount(
-                promo_code_str=promo_code_str,
-                user=user,
-                items_data=prepared_items
-            )
-            attrs["_calc_data"] = calc_result
+        if promo_code:
+            try:
+                attrs["_calc_data"] = PromoCodeService.validate_and_calculate_discount(
+                    promo_code_str=promo_code,
+                    user=user,
+                    items_data=prepared_items,
+                )
+            except PromoCodeValidationError as exc:
+                raise serializers.ValidationError(exc.detail) from exc
         else:
-            # Fallback path if no promo code supplied
-            calculated_items = []
-            total_price = Decimal("0.00")
-            for item in prepared_items:
-                line_total = item["good"].price * item["quantity"]
-                total_price += line_total
-                calculated_items.append({
-                    "good": item["good"],
-                    "quantity": item["quantity"],
-                    "price": item["good"].price,
-                    "discount": Decimal("0.00"),
-                    "total": line_total
-                })
-            attrs["_calc_data"] = {
-                "promo_code_obj": None,
-                "calculated_items": calculated_items,
-                "price": total_price,
-                "discount": Decimal("0.00"),
-                "total": total_price
-            }
+            attrs["_calc_data"] = calculate_order_without_promo(prepared_items)
 
         return attrs
 
     @transaction.atomic
-    def create(self, validated_data):
-        """
-        Persists the order ledger tables and commits promo utilization inside a single transaction.
-        """
+    def create(self, validated_data: dict[str, Any]) -> Order:
         calc_data = validated_data["_calc_data"]
+        user = validated_data["user_id"]
 
         order = Order.objects.create(
-            user=validated_data["user_id"],
+            user=user,
             promo_code_obj=calc_data["promo_code_obj"],
             price=calc_data["price"],
             discount=calc_data["discount"],
-            total=calc_data["total"]
+            total=calc_data["total"],
         )
 
-        order_items = [
-            OrderItem(
-                order=order,
-                good=item["good"],
-                quantity=item["quantity"],
-                price=item["price"],
-                discount=item["discount"],
-                total=item["total"]
-            )
-            for item in calc_data["calculated_items"]
-        ]
-        OrderItem.objects.bulk_create(order_items)
+        OrderItem.objects.bulk_create(
+            [
+                OrderItem(
+                    order=order,
+                    good=item["good"],
+                    quantity=item["quantity"],
+                    price=item["price"],
+                    discount=item["discount"],
+                    total=item["total"],
+                )
+                for item in calc_data["calculated_items"]
+            ]
+        )
 
         if calc_data["promo_code_obj"]:
-            PromoCodeService.register_usage(promocode=calc_data["promo_code_obj"], user=validated_data["user_id"])
+            PromoCodeService.register_usage(promocode=calc_data["promo_code_obj"], user=user)
 
         return order
 
-
-    def to_representation(self, instance):
-        """
-        Reorder properties dynamically to precisely simulate the assignment requirements output sequence.
-        """
-        repr_data = super().to_representation(instance)
+    def to_representation(self, instance: Order) -> dict[str, Any]:
+        data = super().to_representation(instance)
         return {
-            "user_id": repr_data["user_id"],
-            "order_id": repr_data["order_id"],
-            "goods": repr_data["response_goods"],
-            "price": repr_data["price"],
-            "discount": repr_data["discount"],
-            "total": repr_data["total"]
+            "user_id": instance.user_id,
+            "order_id": data["order_id"],
+            "goods": data["response_goods"],
+            "price": data["price"],
+            "discount": data["discount"],
+            "total": data["total"],
         }
