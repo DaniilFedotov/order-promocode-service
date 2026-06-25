@@ -5,16 +5,23 @@ Django-сервис для создания заказов с поддержко
 ## Запуск
 
 ```bash
+git clone https://github.com/DaniilFedotov/order-promocode-service.git
+cd order-promocode-service
+
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 
+# опционально: пустая база с нуля (удобно перед первой проверкой)
+rm -f db.sqlite3
 python manage.py migrate
 python manage.py seed_demo_data
 python manage.py runserver
 ```
 
 `requirements-dev.txt` включает runtime-зависимости из `requirements.txt` и пакеты для тестов.
+
+`pytest` использует in-memory SQLite (`TEST.NAME` в settings) и **не пишет** в `db.sqlite3`.
 
 Повторный запуск `seed_demo_data` сбрасывает счётчики использования промокодов.
 
